@@ -296,6 +296,12 @@ const PAGE_HTML = `<!doctype html>
     background: var(--c-bg-mask);
   }
   #p-dialog.open { display: flex; }
+  #rename-dialog {
+    position: fixed; inset: 0; z-index: 30; display: none;
+    align-items: center; justify-content: center;
+    background: var(--c-bg-mask);
+  }
+  #rename-dialog.open { display: flex; }
   .panel {
     width: min(520px, 92vw); background: var(--c-bg-layer-1);
     border: 1px solid var(--c-border-l2); border-radius: 14px;
@@ -434,6 +440,19 @@ const PAGE_HTML = `<!doctype html>
   </div>
 </div>
 
+<div id="rename-dialog">
+  <div class="panel">
+    <h2>重命名插件</h2>
+    <p style="margin:0 0 4px;font-size:12px;color:var(--c-label-tertiary)">仅修改显示标签，不改变文件夹/包名/文件。</p>
+    <label for="rename-value">显示名称</label>
+    <input id="rename-value" type="text" maxlength="60" placeholder="留空恢复默认名称"/>
+    <div class="row">
+      <button id="rename-cancel">取消</button>
+      <button id="rename-ok" class="primary">保存</button>
+    </div>
+  </div>
+</div>
+
 <div id="progress">
   <div id="progress-text">正在操作…</div>
   <div id="progress-track"><div id="progress-fill"></div></div>
@@ -475,6 +494,7 @@ function setProgress(pct) { progFill.style.width = pct + '%'; }
 function hideProgress() { progEl.classList.remove('open'); }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
 function shortName(t) {
+  if (t.label && t.label.trim()) return t.label.trim();
   const raw = t.moduleName || t.packageName || t.entryId;
   return raw.replace(/^@[^/]+[/]/, '').replace(/^include:/, '').replace(/^cordis:/, '');
 }
@@ -523,7 +543,7 @@ function buildGrid() {
       cell.style.setProperty('--c', colors[cat] || colors.untagged);
       cell.innerHTML = \`<span class="tile-name">\${escapeHtml(shortName(t))}</span><span class="tile-cat">\${escapeHtml(labels[cat] || cat)}</span>\`;
       cell.draggable = true;
-      cell.title = \`\${t.moduleName || t.packageName || t.entryId} · \${t.enabled ? '运行中' : '已禁用'}（点击切换，拖拽排序，右键分类）\`;
+      cell.title = \`\${t.moduleName || t.packageName || t.entryId} · \${t.enabled ? '运行中' : '已禁用'}（点击切换，拖拽排序，右键 分类/重命名）\`;
       cell.addEventListener('click', () => toggle(t.entryId, t.enabled));
       cell.addEventListener('contextmenu', (e) => { e.preventDefault(); openCatMenu(e, t); });
       cell.addEventListener('dragstart', (e) => {
@@ -827,13 +847,25 @@ document.querySelectorAll('#sort-btns button').forEach(b => b.addEventListener('
   buildGrid();
 }));
 
-// category context menu
+// context menu (rename + category)
 const catMenu = document.getElementById('cat-menu');
+const renameDialog = document.getElementById('rename-dialog');
+const renameValue = document.getElementById('rename-value');
 let catTarget = null;
+let renameTarget = null;
 function openCatMenu(e, t) {
   catTarget = t;
   const cur = t.category || 'untagged';
   catMenu.innerHTML = \`<div class="menu-title">\${escapeHtml(shortName(t))}</div>\`;
+  const renameBtn = document.createElement('button');
+  renameBtn.type = 'button';
+  renameBtn.dataset.action = 'rename';
+  renameBtn.innerHTML = '<span>✏️ 重命名</span>';
+  renameBtn.addEventListener('click', () => {
+    catMenu.classList.remove('open');
+    openRenameDialog(t);
+  });
+  catMenu.appendChild(renameBtn);
   for (const [cat, label] of Object.entries(labels)) {
     const b = document.createElement('button');
     b.type = 'button';
@@ -850,6 +882,26 @@ function openCatMenu(e, t) {
   catMenu.style.top = Math.max(4, y) + 'px';
   catMenu.classList.add('open');
 }
+function openRenameDialog(t) {
+  renameTarget = t;
+  renameValue.value = t.label || shortName(t);
+  renameDialog.classList.add('open');
+  setTimeout(() => renameValue.focus(), 50);
+}
+async function saveRename() {
+  if (!renameTarget) return;
+  const label = renameValue.value.trim();
+  renameDialog.classList.remove('open');
+  const r = await http('POST', '/set-label', { entryId: renameTarget.entryId, label });
+  if (!r.ok) { toast(r.message || '重命名失败'); return; }
+  await load();
+  toast(label ? '已重命名' : '已恢复默认名称');
+}
+document.getElementById('rename-cancel').addEventListener('click', () => renameDialog.classList.remove('open'));
+document.getElementById('rename-ok').addEventListener('click', saveRename);
+renameDialog.addEventListener('click', (e) => {
+  if (e.target === renameDialog) renameDialog.classList.remove('open');
+});
 async function setCategory(entryId, cat) {
   catMenu.classList.remove('open');
   const r = await http('POST', '/set-category', { folderName: entryId, category: cat });
@@ -858,8 +910,16 @@ async function setCategory(entryId, cat) {
 }
 document.addEventListener('click', (e) => {
   if (!catMenu.contains(e.target)) catMenu.classList.remove('open');
+  if (renameDialog.classList.contains('open') && !renameDialog.contains(e.target) && !catMenu.contains(e.target)) {
+    renameDialog.classList.remove('open');
+  }
 });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') catMenu.classList.remove('open'); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    catMenu.classList.remove('open');
+    renameDialog.classList.remove('open');
+  }
+});
 
 // tabs
 document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => {

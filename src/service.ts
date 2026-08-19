@@ -18,7 +18,7 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import * as yaml from 'js-yaml'
 import {
   cpSync,
@@ -93,18 +93,28 @@ function fail(code: PluginManagerErrorCode, message: string): never {
 
 /** The declared entry point of an installed package, if any. */
 function resolveEntry(manifest: { main?: string; exports?: Record<string, unknown> }): string | undefined {
-  const dot = manifest.exports?.['.'] as Record<string, unknown> | undefined
+  const dot = manifest.exports?.['.']
+  if (typeof dot === 'string') return dot
   if (typeof dot === 'object' && dot !== null) {
-    const candidates: Record<string, unknown> = {
-      default: dot['default'],
-      import: dot['import'],
-      require: dot['require'],
-    }
-    for (const candidate of Object.values(candidates)) {
+    const record = dot as Record<string, unknown>
+    for (const candidate of [record['default'], record['import'], record['require']]) {
       if (typeof candidate === 'string') return candidate
     }
   }
   return manifest.main
+}
+
+/** The declared client bundle path of an installed package, defaulting to `lib/client.js`. */
+function resolveClient(manifest: { exports?: Record<string, unknown> }): string {
+  const client = manifest.exports?.['./client']
+  if (typeof client === 'string') return client
+  if (typeof client === 'object' && client !== null) {
+    const record = client as Record<string, unknown>
+    for (const candidate of [record['default'], record['import'], record['require']]) {
+      if (typeof candidate === 'string') return candidate
+    }
+  }
+  return 'lib/client.js'
 }
 
 /** Locate a real bash (Git for Windows), not the WSL stub in System32. */
@@ -165,6 +175,7 @@ export class PluginManagerService extends Service {
   private readonly sharedLinkPath: string
   private readonly overridesPath: string
   private readonly layoutPath: string
+  private readonly labelsPath: string
   private readonly presetsDir: string
 
   /**
@@ -184,6 +195,7 @@ export class PluginManagerService extends Service {
     this.sharedLinkPath = join(this.mypackagesDir, 'node_modules')
     this.overridesPath = join(this.homeDir, 'kmanager.overrides.json')
     this.layoutPath = join(this.homeDir, 'kmanager.layout.json')
+    this.labelsPath = join(this.homeDir, 'kmanager.labels.json')
     this.presetsDir = join(this.homeDir, '.agent-presets')
   }
 
@@ -229,6 +241,40 @@ export class PluginManagerService extends Service {
     )
   }
 
+  /** Read user-facing display labels keyed by entry id. */
+  private readLabels(): Record<string, string> {
+    if (!existsSync(this.labelsPath)) return {}
+    try {
+      const raw = JSON.parse(readFileSync(this.labelsPath, 'utf8')) as unknown
+      if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+      const labels: Record<string, string> = {}
+      for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+        if (typeof value === 'string' && value.trim().length > 0) labels[key] = value.trim()
+      }
+      return labels
+    } catch {
+      return {}
+    }
+  }
+
+  /**
+   * Set a plugin's display label (a UI-only alias). The label is persisted in
+   * the harness home and never touches the plugin's folder, package name, or
+   * Loader entry. Pass an empty string to clear the label back to the default.
+   * @param entryId - the plugin entry id shown by the manager.
+   * @param label - the new display label, or '' to remove it.
+   */
+  setLabel(entryId: string, label: string): void {
+    const labels = this.readLabels()
+    const trimmed = label.trim()
+    if (trimmed.length === 0) {
+      delete labels[entryId]
+    } else {
+      labels[entryId] = trimmed
+    }
+    writeFileSync(this.labelsPath, JSON.stringify(labels, null, 2) + '\n', 'utf8')
+  }
+
 /** Read Loader rows sourced from the composed tree (official plugins). */
   private readOfficialEntries(): OfficialPluginView[] {
     const loader = this.ctx.get('loader') as
@@ -236,17 +282,20 @@ export class PluginManagerService extends Service {
       | undefined
     const customNames = this.customFolderNames()
     const entries: OfficialPluginView[] = []
+    const labels = this.readLabels()
     if (loader !== undefined) {
       for (const entry of loader.entries()) {
         const bareId = entry.options.id ?? entry.id
         if (entry.options.group || customNames.has(bareId)) continue
         const moduleName = entry.options.name ?? entry.id
+        const label = labels[entry.id]
         entries.push({
           entryId: entry.id as PluginEntryId,
           moduleName,
           enabled: !entry.disabled,
           fiberPhase: null,
           category: this.officialCategory(entry.id, moduleName),
+          ...(label !== undefined ? { label } : {}),
         })
       }
     } else {
@@ -254,12 +303,14 @@ export class PluginManagerService extends Service {
       // custom mounts are, by elimination, official entries.
       for (const row of this.loadRows()) {
         if (!row.inserted || customNames.has(row.id)) continue
+        const label = labels[row.id]
         entries.push({
           entryId: row.id as PluginEntryId,
           moduleName: row.name ?? row.id,
           enabled: !row.disabled,
           fiberPhase: null,
           category: this.officialCategory(row.id, row.name ?? row.id),
+          ...(label !== undefined ? { label } : {}),
         })
       }
     }
@@ -280,6 +331,7 @@ export class PluginManagerService extends Service {
   private readCustomPlugins(): CustomPluginView[] {
     if (!existsSync(this.mypackagesDir)) return []
     const custom: CustomPluginView[] = []
+    const labels = this.readLabels()
     for (const dirent of readdirSync(this.mypackagesDir, { withFileTypes: true })) {
       if (!dirent.isDirectory() || dirent.name === 'node_modules') continue
       const packageJsonPath = join(this.mypackagesDir, dirent.name, 'package.json')
@@ -289,6 +341,7 @@ export class PluginManagerService extends Service {
           packageName = (JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { name?: string }).name ?? packageName
         } catch { /* keep the folder-derived default */ }
       }
+      const label = labels[dirent.name]
       custom.push({
         entryId: dirent.name as PluginEntryId,
         packageName,
@@ -296,6 +349,7 @@ export class PluginManagerService extends Service {
         enabled: this.isRegistered(dirent.name),
         fiberPhase: null,
         category: this.customCategory(dirent.name, packageJsonPath),
+        ...(label !== undefined ? { label } : {}),
       })
     }
     return custom
@@ -341,6 +395,11 @@ export class PluginManagerService extends Service {
     // afterward) would never take effect. Guard the row the way the web
     // bundle does — it is not a runtime toggle.
     if (baseId === 'hmr') fail('IMMUTABLE_ENTRY', 'hmr hosts the live patch reload and cannot be toggled')
+    // This plugin hosts the manager page and route: disabling it locks the
+    // user out of the very UI that could re-enable it. Not a runtime toggle.
+    if (baseId === 'dsh-plugin-kmanager') {
+      fail('IMMUTABLE_ENTRY', 'dsh-plugin-kmanager hosts the manager and cannot be toggled')
+    }
     const rows = this.loadRows()
     const index = rows.findIndex(row => row.id === baseId)
     if (index < 0) {
@@ -382,11 +441,15 @@ export class PluginManagerService extends Service {
 
   /**
    * Add a custom plugin from a git URL, ZIP archive, or existing folder.
-   * The plugin lands in mypackages and is registered in the home patch.
+   * Fed to the source checkout's official CLI enough for the pnpm pipeline to
+   * build a vite-shaped plugin; zipPath / folderPath use the mypackages flow.
    * @param source - exactly one of gitUrl / zipPath / folderPath.
    * @returns the installed custom plugin view.
    */
   add(source: PluginAddSource): CustomPluginView {
+    if ('gitUrl' in source) {
+      return this.addFromGit(source.gitUrl)
+    }
     const folderName = this.materialize(source)
     this.ensureSharedLink()
     this.ensureBuilt(folderName)
@@ -409,6 +472,109 @@ export class PluginManagerService extends Service {
     }
   }
 
+  /**
+   * Install a package from a git URL / npm spec into mypackages directly.
+   *
+   * Registry-hosted plugins (npm spec or the npm package behind a github
+   * repo) are fetched as their prebuilt tarball and extracted into
+   * mypackages — no source clone, no build step, and the installed files
+   * really live under mypackages (unlike `dsh plugin add`, which installs
+   * into the profile's own node_modules). This keeps vite-shaped packages
+   * (e.g. @liustack/modlens) working the same way the official CLI does.
+   * @param url - an npm package spec, or a git URL.
+   * @returns the installed custom plugin view.
+   */
+  private addFromGit(url: string): CustomPluginView {
+    const spec = url.trim()
+    if (!/^[^\s]+$/u.test(spec) || spec.length === 0) {
+      fail('SOURCE_UNREACHABLE', 'plugin spec must be a single token')
+    }
+    const folderName = this.folderNameFromGit(spec)
+    const pkgPath = join(this.mypackagesDir, folderName)
+    if (existsSync(pkgPath)) fail('PLUGIN_ALREADY_EXISTS', `mypackages/${folderName} already exists`)
+    mkdirSync(pkgPath, { recursive: true })
+    const resolved = this.npmSpec(spec)
+    const result = spawnSync('npm', ['pack', resolved, '--silent', '--pack-destination', pkgPath], {
+      cwd: this.mypackagesDir, encoding: 'utf8', stdio: 'pipe',
+    })
+    if (result.error !== undefined || result.status !== 0) {
+      rmSync(pkgPath, { recursive: true, force: true })
+      fail('SOURCE_UNREACHABLE', `npm pack failed for ${resolved}: ${(result.stderr ?? String(result.error)).trim().slice(-300)}`)
+    }
+    const tarball = this.firstTarball(pkgPath)
+    if (tarball === undefined) {
+      rmSync(pkgPath, { recursive: true, force: true })
+      fail('SOURCE_UNREACHABLE', `npm pack produced no tarball for ${resolved}`)
+    }
+    // npm tarballs root at `package/`; flatten it into the folder and drop the
+    // downloaded archive so only the plugin's own files remain in mypackages.
+    this.extractTarball(tarball, pkgPath)
+    rmSync(tarball, { force: true })
+    this.ensureSharedLink()
+    this.ensureBuilt(folderName)
+    const packageJsonPath = join(pkgPath, 'package.json')
+    let packageName = `@deepseek-ai/${folderName}`
+    if (existsSync(packageJsonPath)) {
+      try {
+        packageName = (JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { name?: string }).name ?? packageName
+      } catch { /* keep the folder-derived default */ }
+    }
+    this.writeRow(folderName, packageName)
+    this.mount(folderName, packageName)
+    return {
+      entryId: folderName as PluginEntryId,
+      packageName,
+      folderName,
+      enabled: true,
+      fiberPhase: null,
+      category: this.customCategory(folderName, packageJsonPath),
+    }
+  }
+
+  /** Normalize a git/URL-style spec to a registry package name. */
+  private npmSpec(spec: string): string {
+    // npm / github scoped names pass through; host URLs map to owner/repo.
+    const github = /^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/#]+)/u.exec(spec)
+    if (github !== null && spec.includes('github.com')) {
+      return `${github[1]!}/${github[2]!.replace(/\.git$/u, '')}`
+    }
+    return spec.replace(/^github:/u, '')
+  }
+
+  /** The newest `*.tgz` produced in a directory, if any. */
+  private firstTarball(dir: string): string | undefined {
+    const found = readdirSync(dir).filter(name => /\.tgz$/iu.test(name)).sort()
+    return found.length > 0 ? join(dir, found[found.length - 1]!) : undefined
+  }
+
+  /** Expand a npm tarball, flattening its `package/` root into the folder. */
+  private extractTarball(tarball: string, dir: string): void {
+    const staging = join(dir, '__pkg')
+    mkdirSync(staging, { recursive: true })
+    try {
+      execFileSync('tar', ['-xzf', tarball, '-C', staging], { cwd: dir, encoding: 'utf8', stdio: 'pipe' })
+      const root = join(staging, 'package')
+      if (existsSync(root)) {
+        for (const name of readdirSync(root)) {
+          const from = join(root, name)
+          const to = join(dir, name)
+          if (existsSync(to)) rmSync(to, { recursive: true, force: true })
+          cpSync(from, to, { recursive: true })
+        }
+      }
+    } catch (error) {
+      fail('SOURCE_UNREACHABLE', `tarball extraction failed: ${String(error)}`)
+    } finally {
+      rmSync(staging, { recursive: true, force: true })
+    }
+  }
+
+  /** The last path segment of a git spec, sans `.git`. */
+  private folderNameFromGit(spec: string): string {
+    const clean = spec.replace(/\.git$/u, '')
+    return clean.split('/').pop() ?? 'plugin'
+  }
+
   /** Bring a plugin into mypackages from the requested source kind. */
   private materialize(source: PluginAddSource): string {
     const entries = Object.entries(source).filter(([, value]) => value !== undefined)
@@ -417,7 +583,6 @@ export class PluginManagerService extends Service {
     }
     const [kind, value] = entries[0] as [string, string]
     mkdirSync(this.mypackagesDir, { recursive: true })
-    if (kind === 'gitUrl') return this.cloneFrom(value)
     if (kind === 'zipPath') return this.unzip(value.trim())
     return this.copyFrom(value.trim())
   }
@@ -459,24 +624,6 @@ export class PluginManagerService extends Service {
       /* v8 ignore next -- the temp archive is best-effort cleanup */
       if (existsSync(tmpZip)) rmSync(tmpZip, { force: true })
     }
-  }
-
-  /** git clone the remote into mypackages; returns the cloned folder name. */
-  private cloneFrom(url: string): string {
-    const trimmed = url.trim()
-    if (!/^[^\s]+$/u.test(trimmed) || trimmed.length === 0) {
-      fail('SOURCE_UNREACHABLE', 'git URL must be a single token')
-    }
-    const base = trimmed.replace(/\.git$/u, '').split('/').pop() ?? 'plugin'
-    const dest = join(this.mypackagesDir, base)
-    if (existsSync(dest)) fail('PLUGIN_ALREADY_EXISTS', `mypackages/${base} already exists`)
-    try {
-      execFileSync('git', ['clone', '--depth', '1', trimmed, base], { cwd: this.mypackagesDir, encoding: 'utf8', stdio: 'pipe' })
-    } catch (error) {
-      if (existsSync(dest)) rmSync(dest, { recursive: true, force: true })
-      fail('SOURCE_UNREACHABLE', `git clone failed: ${String(error)}`)
-    }
-    return base
   }
 
   /** Expand a ZIP into mypackages; returns the extracted folder name. */
@@ -598,12 +745,13 @@ export class PluginManagerService extends Service {
       symlinkSync(checkoutTypes, join(typesDir, 'node'), 'junction')
     }
     const entry = resolveEntry(manifest)
+    const clientEntry = resolveClient(manifest)
     const stripBash = (value: string): string => value.trim().replace(/^bash\s+/u, '')
     const mainMissing = !!entry && !existsSync(join(dir, entry))
     const build = manifest.scripts?.build
     const buildClient = manifest.scripts?.['build:client']
     const hasClient = manifest.dsh?.client !== undefined
-    const clientMissing = hasClient && !existsSync(join(dir, 'lib', 'client.js'))
+    const clientMissing = hasClient && !existsSync(join(dir, clientEntry))
     if (!mainMissing && !clientMissing) return
     if (mainMissing || clientMissing) linkBuildTypes()
     if (mainMissing) {
@@ -619,8 +767,8 @@ export class PluginManagerService extends Service {
     if (mainMissing && !existsSync(join(dir, entry))) {
       fail('BUILD_FAILED', `${folderName}: build finished but ${entry} is still missing`)
     }
-    if (clientMissing && !existsSync(join(dir, 'lib', 'client.js'))) {
-      fail('BUILD_FAILED', `${folderName}: client build finished but lib/client.js is still missing`)
+    if (clientMissing && !existsSync(join(dir, clientEntry))) {
+      fail('BUILD_FAILED', `${folderName}: client build finished but ${clientEntry} is still missing`)
     }
   }
 
@@ -690,9 +838,12 @@ export class PluginManagerService extends Service {
   /**
    * Remove a custom plugin: delete its mypackages folder and its Loader row.
    * Official plugins cannot be removed.
-   * @param entryId - the custom plugin's entry id.
+   * @param entryId - the plugin's entry id.
    */
   remove(entryId: string): void {
+    if (entryId === 'dsh-plugin-kmanager') {
+      fail('IMMUTABLE_ENTRY', 'dsh-plugin-kmanager hosts the manager and cannot be removed')
+    }
     const row = this.findRow(entryId)
     if (!row?.inserted) {
       fail('PLUGIN_NOT_FOUND', `official plugins cannot be removed, disable instead: ${entryId}`)
@@ -968,7 +1119,9 @@ export class PluginManagerService extends Service {
       candidates.push(join(profileModules, '@deepseek-ai', folderName))
     }
     for (const linkPath of candidates) {
-      if (existsSync(linkPath)) rmSync(linkPath, { recursive: true, force: true })
+      // rmSync removes the symlink itself even when its target is already gone
+      // (dangling junction), and `force` makes a missing path a no-op.
+      rmSync(linkPath, { recursive: true, force: true })
     }
   }
 

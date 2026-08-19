@@ -43,6 +43,8 @@ export interface OfficialPluginView {
   readonly enabled: boolean
   readonly fiberPhase: PluginFiberPhase
   readonly category: PluginCategory
+  /** Optional user-facing display label; does not rename any file or entry. */
+  readonly label?: string
 }
 
 /** One custom plugin installed from mypackages. */
@@ -56,6 +58,8 @@ export interface CustomPluginView {
   readonly enabled: boolean
   readonly fiberPhase: PluginFiberPhase
   readonly category: PluginCategory
+  /** Optional user-facing display label; does not rename any file or entry. */
+  readonly label?: string
 }
 
 /** Grid ordering per page, persisted across restarts. */

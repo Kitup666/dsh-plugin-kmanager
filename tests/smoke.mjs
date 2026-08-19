@@ -45,6 +45,13 @@ service.setCustomCategory(added.folderName, 'llm')
 assert.equal(service.list().custom[0].category, 'llm')
 assert.ok(existsSync(join(home, 'kmanager.overrides.json')))
 
+// display label is a UI-only alias: persisted separately and clears to default
+service.setLabel(added.entryId, '我的插件')
+assert.equal(service.list().custom[0].label, '我的插件')
+assert.ok(existsSync(join(home, 'kmanager.labels.json')))
+service.setLabel(added.entryId, '   ')
+assert.equal(service.list().custom[0].label, undefined)
+
 // disable then re-enable; the home patch row carries the flag
 service.setEnabled(added.entryId, false)
 assert.equal(service.list().custom[0].enabled, false)

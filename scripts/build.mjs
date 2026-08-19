@@ -21,6 +21,8 @@ import { fileURLToPath } from 'node:url'
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const CHECKOUT_CANDIDATES = [
   process.env.DSH_CHECKOUT,
+  join(ROOT, '..', '..', 'deepseek-harness-master'),
+  join(ROOT, '..', '..', 'deepseek-harness'),
   'D:/DeepseekH/deepseek-harness-master',
   'D:/DeepseekH/deepseek-harness',
   join(process.env.USERPROFILE ?? 'C:', 'deepseek-harness-master'),

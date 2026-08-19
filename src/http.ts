@@ -1,8 +1,8 @@
 /**
  * Browser HTTP carrier for the plugin manager. Registers a `/api/kmanager`
  * prefix route on the Host `webServer` service when it exists, answering list,
- * enable/disable, add, remove, and manual-category JSON calls so a UI half can
- * drive the service without a Typert Remote.
+ * enable/disable, add, remove, manual-category, and display-label JSON calls so
+ * a UI half can drive the service without a Typert Remote.
  *
  * Route seats are composition-level contracts: registration is refused when the
  * seat is already claimed, so a second manager copy fails loudly instead of
@@ -156,6 +156,15 @@ async function dispatch(
       const category = asCategory(body?.category)
       service.setCustomCategory(folderName, category)
       return { ok: true, data: { folderName, category } }
+    }
+    if (segment === 'set-label') {
+      const entryId = asString(body?.entryId, 'entryId')
+      const label = body?.label
+      if (typeof label !== 'string') {
+        throw new PluginManagerError('PLUGIN_NOT_FOUND', 'label must be a string')
+      }
+      service.setLabel(entryId, label)
+      return { ok: true, data: { entryId, label } }
     }
     if (segment === 'remove') {
       const entryId = asString(body?.entryId, 'entryId')
